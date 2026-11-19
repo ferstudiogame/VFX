@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'scripts/generate_vfx.py'
+      - 'godot/**'
       - '.github/workflows/build-vfx.yml'
   workflow_dispatch:
 
@@ -132,7 +133,8 @@ jobs:
       - name: Package downloadable VFX library
         run: |
           mkdir -p dist
-          cp -r godot dist/ 2>/dev/null || true
+          mkdir -p dist/godot
+          cp godot/VFXLibrary.gd dist/godot/
           cp -r exports previews dist/
           cp scripts/generate_vfx.py dist/
           cp .github/workflows/build-vfx.yml dist/
