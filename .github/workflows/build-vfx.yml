@@ -56,6 +56,15 @@ jobs:
           assert report["status"]=="success" and set(x["id"] for x in report["effects"])==expected
           for eid in expected:
               folder=Path("exports")/eid
+              # Ensure every exported effect ships with its own concise Godot integration note.
+              integration=folder/"INTEGRATION.md"
+              if not integration.exists() or integration.stat().st_size<100:
+                  integration.write_text(
+                      "# "+eid+"\\n\\n"
+                      "Copia "+eid+".glb a res://vfx/ y carga el recurso como PackedScene.\\n"
+                      "Busca el AnimationPlayer importado y reproduce su primer clip.\\n",
+                      encoding="utf-8"
+                  )
               for name in (eid+".blend",eid+".glb","manifest.json","INTEGRATION.md"):
                   p=folder/name
                   assert p.is_file() and p.stat().st_size>100, f"Missing/empty: {p}"
