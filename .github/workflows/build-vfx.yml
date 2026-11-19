@@ -1,0 +1,149 @@
+name: Build Blender VFX Library
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/generate_vfx.py'
+      - '.github/workflows/build-vfx.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vfx-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl xz-utils zip unzip xvfb libx11-6 libxxf86vm1 libxfixes3 libxrender1 libxi6 libxkbcommon0 libsm6 libgl1 libgl1-mesa-dri libegl1
+
+      - name: Download and verify Blender 4.5.16 LTS
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          FILE="blender-4.5.16-linux-x64.tar.xz"
+          BASE="https://download.blender.org/release/Blender4.5"
+          curl -fL --retry 3 "$BASE/$FILE" -o "$FILE"
+          curl -fL --retry 3 "$BASE/blender-4.5.16.sha256" -o blender.sha256
+          grep "$FILE" blender.sha256 | sha256sum --check
+          mkdir blender
+          tar -xf "$FILE" -C blender --strip-components=1
+          "$RUNNER_TEMP/blender/blender" --version
+
+      - name: Generate all seven effects in Blender
+        run: |
+          mkdir -p exports previews
+          xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 "$RUNNER_TEMP/blender/blender" --background --factory-startup --python-exit-code 1 --python scripts/generate_vfx.py -- --effects all --output exports --previews previews
+
+      - name: Validate Blender outputs
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = {"electric_arc","impact_burst","energy_orb","fireburst","ice_shatter","portal_gate","plasma_bolt"}
+          report=json.loads(Path("exports/build_report.json").read_text())
+          assert report["status"]=="success" and set(x["id"] for x in report["effects"])==expected
+          for eid in expected:
+              folder=Path("exports")/eid
+              for name in (eid+".blend",eid+".glb","manifest.json","INTEGRATION.md"):
+                  p=folder/name
+                  assert p.is_file() and p.stat().st_size>100, f"Missing/empty: {p}"
+              png=Path("previews")/(eid+".png")
+              assert png.is_file() and png.stat().st_size>1000, f"Missing preview: {png}"
+          print("All 7 Blender scenes, GLBs, manifests and rendered previews exist.")
+          PY
+
+      - name: Download Godot 4.7.2
+        run: |
+          set -euo pipefail
+          URL="https://downloads.godotengine.org/?flavor=stable&platform=linux.64&slug=linux.x86_64.zip&version=4.7.2"
+          curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/godot.zip"
+          mkdir "$RUNNER_TEMP/godot"
+          unzip -q "$RUNNER_TEMP/godot.zip" -d "$RUNNER_TEMP/godot"
+          GODOT="$(find "$RUNNER_TEMP/godot" -type f -name 'Godot*' | head -n 1)"
+          chmod +x "$GODOT"
+          echo "GODOT_BIN=$GODOT" >> "$GITHUB_ENV"
+          "$GODOT" --headless --version
+
+      - name: Import every GLB in Godot
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/godot-smoke/vfx"
+          cp exports/*/*.glb "$RUNNER_TEMP/godot-smoke/vfx/"
+          cat > "$RUNNER_TEMP/godot-smoke/project.godot" <<'EOF'
+          config_version=5
+          [application]
+          config/name="VFX Import Validation"
+          EOF
+          cat > "$RUNNER_TEMP/godot-smoke/smoke.gd" <<'EOF'
+          extends SceneTree
+          func _initialize():
+              var dir = DirAccess.open("res://vfx")
+              if dir == null:
+                  push_error("VFX directory missing")
+                  quit(1)
+                  return
+              var count = 0
+              for file in dir.get_files():
+                  if not file.ends_with(".glb"):
+                      continue
+                  var packed = load("res://vfx/" + file) as PackedScene
+                  if packed == null:
+                      push_error("Could not import " + file)
+                      quit(1)
+                      return
+                  var instance = packed.instantiate()
+                  var player = _find_player(instance)
+                  if player == null or player.get_animation_list().is_empty():
+                      push_error("No animation in " + file)
+                      quit(1)
+                      return
+                  player.play(player.get_animation_list()[0])
+                  count += 1
+                  instance.free()
+              if count != 7:
+                  push_error("Expected 7 imported GLBs, got " + str(count))
+                  quit(1)
+                  return
+              print("GODOT_IMPORT_SUCCESS: 7 animated GLBs imported and played")
+              quit(0)
+          func _find_player(node):
+              if node is AnimationPlayer:
+                  return node
+              for child in node.get_children():
+                  var found = _find_player(child)
+                  if found != null:
+                      return found
+              return null
+          EOF
+          "$GODOT_BIN" --headless --editor --path "$RUNNER_TEMP/godot-smoke" --import --quit
+          "$GODOT_BIN" --headless --path "$RUNNER_TEMP/godot-smoke" --script "$RUNNER_TEMP/godot-smoke/smoke.gd"
+
+      - name: Package downloadable VFX library
+        run: |
+          mkdir -p dist
+          cp -r godot dist/ 2>/dev/null || true
+          cp -r exports previews dist/
+          cp scripts/generate_vfx.py dist/
+          cp .github/workflows/build-vfx.yml dist/
+          (cd dist && zip -qr ../blender-vfx-library-godot4.zip .)
+          sha256sum blender-vfx-library-godot4.zip > blender-vfx-library-godot4.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blender-vfx-library-godot4
+          path: |
+            blender-vfx-library-godot4.zip
+            blender-vfx-library-godot4.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
